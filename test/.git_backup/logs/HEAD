@@ -1,0 +1,8 @@
+0000000000000000000000000000000000000000 a55c4af8e97f90a0316082a4ebc43f08492e18e0 zzx <zhangzhixiang2333@icloud.com> 1786759703 +0800	commit (initial): init: STM32F427 G3508 project
+a55c4af8e97f90a0316082a4ebc43f08492e18e0 0000000000000000000000000000000000000000 zzx <zhangzhixiang2333@icloud.com> 1786759718 +0800	Branch: renamed refs/heads/main to refs/heads/main
+a55c4af8e97f90a0316082a4ebc43f08492e18e0 a55c4af8e97f90a0316082a4ebc43f08492e18e0 zzx <zhangzhixiang2333@icloud.com> 1786759718 +0800	Branch: renamed refs/heads/main to refs/heads/main
+a55c4af8e97f90a0316082a4ebc43f08492e18e0 db39a13853f413a1162b12fc9b891af897a95870 zzx <zhangzhixiang2333@icloud.com> 1786760128 +0800	commit (merge): 1
+db39a13853f413a1162b12fc9b891af897a95870 5c48d11f2935f5cf588328f3b42bbe97ab5a2132 zzx <zhangzhixiang2333@icloud.com> 1786763841 +0800	commit: 现在可以使用lf rf分别控制每个电机速度 然后全都给200 底盘逆时针旋转
+5c48d11f2935f5cf588328f3b42bbe97ab5a2132 c4ae81c6f4611b38fa253e430a8d256c9dc05c9d zzx <zhangzhixiang2333@icloud.com> 1786765858 +0800	commit: 现在底盘小毕业 各个方向都能跑了
+c4ae81c6f4611b38fa253e430a8d256c9dc05c9d 56d3c31ea7631d238bee0d594b7693e4f7e723fc zzx <zhangzhixiang2333@icloud.com> 1786768376 +0800	commit: 移植了一半
+56d3c31ea7631d238bee0d594b7693e4f7e723fc 139003a2d7395e6292ef039d2864f9ee90ef8ec2 zzx <zhangzhixiang2333@icloud.com> 1787371922 +0800	commit: 现在能控制两个摩擦轮 还有一个达妙了

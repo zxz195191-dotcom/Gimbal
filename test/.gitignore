@@ -1,0 +1,26 @@
+# Build outputs
+build/
+cmake-build-*/
+cmake-build-debug/
+cmake-build-release/
+
+# CLion / JetBrains IDE
+.idea/
+*.iml
+
+# Compiled artifacts
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.d
+
+# STM32CubeMX generated metadata
+.mxproject
+
+# OS junk
+Thumbs.db
+.DS_Store
