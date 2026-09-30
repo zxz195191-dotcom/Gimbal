@@ -2,6 +2,7 @@
 #include <math.h>
 
 #define DEG_TO_RAD                   0.017453292519943295f
+#define RAD_TO_DEG                   57.29577951308232
 #define AXIS_CONTROL_PERIOD_MS       5U
 #define AXIS_ENABLE_DELAY_MS         20U
 #define AXIS_ENABLE_TIMEOUT_MS       500U
@@ -22,6 +23,17 @@
 #define GIMBAL_KEY_DEBOUNCE_MS       30U
 #define GIMBAL_KEY_LONG_PRESS_MS     1000U
 #define GIMBAL_CAN_HANDLE            (&hcan2)
+#define PITCH_SAMPLE_COUNT 15U
+#define PITCH_GRAVITY_FF_MIN_DEG       10.0f
+#define PITCH_GRAVITY_FF_MAX_DEG       35.0f
+#define PITCH_GRAVITY_FF_MAX_ABS_NM     3.0f
+#define PITCH_GRAVITY_FF_RATE_NM_S       1.0f
+#define PITCH_GRAVITY_FF_MAX_STEP_MS    20U
+#define PITCH_MOVE_DETECT_DEG            0.2f
+
+static void pitch_gravity_ff_reset(void);
+
+static float pitch_gravity_ff_update(float measured_deg, uint32_t elapsed_ms);
 
 typedef struct {
   volatile Yaw_Test_t *status;
@@ -105,6 +117,8 @@ static void axis_enter_fault(Gimbal_Axis_Runtime_t *axis, Yaw_Fault_e fault) {
   axis->status->state = YAW_TEST_FAULT;
   axis->status->target_relative_rad = axis->status->measured_relative_rad;
   axis->status->command_relative_rad = axis->status->measured_relative_rad;
+  axis->status->applied_t_ff_nm = 0.0f;
+  if (axis->feedback_id == Pitch) pitch_gravity_ff_reset();
 }
 
 static void axis_stop(Gimbal_Axis_Runtime_t *axis) {
@@ -113,9 +127,13 @@ static void axis_stop(Gimbal_Axis_Runtime_t *axis) {
   axis->status->fault = YAW_FAULT_NONE;
   axis->status->target_relative_rad = axis->status->measured_relative_rad;
   axis->status->command_relative_rad = axis->status->measured_relative_rad;
+  axis->status->applied_t_ff_nm = 0.0f;
+  if (axis->feedback_id == Pitch) pitch_gravity_ff_reset();
 }
 
 static void axis_begin_enable(Gimbal_Axis_Runtime_t *axis, uint32_t now_ms) {
+  axis->status->applied_t_ff_nm = 0.0f;
+  if (axis->feedback_id == Pitch) pitch_gravity_ff_reset();
   if ((g_can2_filter_ret != HAL_OK) ||
       (g_can2_start_ret != HAL_OK) ||
       (g_can2_notify_ret != HAL_OK)) {
@@ -133,6 +151,8 @@ static void axis_begin_enable(Gimbal_Axis_Runtime_t *axis, uint32_t now_ms) {
   axis->status->state = YAW_TEST_CLEARING;
   axis->status->fault = YAW_FAULT_NONE;
 }
+
+static int8_t pitch_approach_sign = 1;
 
 static void axis_update(Gimbal_Axis_Runtime_t *axis, uint32_t now_ms) {
   volatile Yaw_Test_t *status = axis->status;
@@ -308,24 +328,46 @@ static void axis_update(Gimbal_Axis_Runtime_t *axis, uint32_t now_ms) {
   } else if (command_error < -max_step) {
     command_step = -max_step;
     target_velocity_rad_s = -status->max_speed_rad_s;
-  ////////////////////////限幅
-
-
-  } else {
+  }
+  else {
     command_step = command_error;
   }
+  ////////////////////////限幅
+
+  if (axis->feedback_id == Pitch) {
+    if (command_step > 0.0f) {
+      pitch_approach_sign  = 1 ;
+    }
+    else if (command_step < 0.0f) {
+      pitch_approach_sign = -1 ;
+    }
+  }
+
+
+
+
   status->command_relative_rad += command_step;
 
   /* Close the session coordinate loop from the latest measured raw position. */
   const float motor_target_rad = motor->p_int + axis->direction *
       (status->command_relative_rad - status->measured_relative_rad);
 
+  float t_ff_nm = 0.0f;
+  if (axis->feedback_id == Pitch) {
+    const float logical_t_ff_nm = pitch_gravity_ff_update(
+        // status->measured_relative_rad * RAD_TO_DEG, elapsed_ms);
+        status->command_relative_rad * RAD_TO_DEG, elapsed_ms);
+
+    t_ff_nm = axis->direction * logical_t_ff_nm;
+  }
+  status->applied_t_ff_nm = t_ff_nm;
+
 
   ///////////////////////////////保险
   if (dm4310_send_mit(GIMBAL_CAN_HANDLE, axis->motor_id,
                       motor_target_rad,
                       axis->direction * target_velocity_rad_s,
-                      status->kp, status->kd, 0.0f) != HAL_OK) {
+                      status->kp, status->kd, t_ff_nm) != HAL_OK) {
     axis_enter_fault(axis, YAW_FAULT_TX);
     return;
   }
@@ -466,7 +508,7 @@ void Gimbal_Yaw_Test_Init(void) {
 }
 
 void Gimbal_Yaw_Test_Update(uint32_t now_ms, GPIO_PinState key_level) {
-  gimbal_update_key(now_ms, key_level);//按键状态变化的时刻更新一次时间 然后更新角度 但是用的不是按钮控制角度啊
+  gimbal_update_key(now_ms, key_level);
   axis_update(&axes[Yaw], now_ms);
   axis_update(&axes[Pitch], now_ms);
 }
@@ -549,4 +591,439 @@ uint8_t Gimbal_Pitch_Set_Kp(float kp) {
 }
 uint8_t Gimbal_Pitch_Set_Kd(float kd) {
   return axis_set_kd(&axes[Pitch], kd);
+}
+
+
+typedef struct {
+  float error_up_deg;
+  float error_down_deg;
+
+  float torque_up;
+  float torque_down;
+
+  float gravity_torque;
+  float friction_torque;
+
+}Pitch_Compensation_Result_t;
+
+
+//TODO
+//优化成指针
+Pitch_Compensation_Result_t Pitch_Calc_Comp(float target_deg,float measured_up_deg,float measured_down_deg,float t_int_up,float t_int_down) {
+  Pitch_Compensation_Result_t result = {0};//局部很有必要
+
+  result.error_up_deg = target_deg - measured_up_deg;//可能出现的-号会很有价值（补偿过头）
+  result.error_down_deg = target_deg - measured_down_deg;
+
+  // result.torque_up = kp * result.error_up_deg * DEG_TO_RAD;
+  // result.torque_down = kp * result.error_down_deg * DEG_TO_RAD;
+
+  result.torque_up = t_int_up;
+  result.torque_down = t_int_down;
+
+  result.gravity_torque = (result.torque_up + result.torque_down) * 0.5f;
+  result.friction_torque = (result.torque_up - result.torque_down) * 0.5f;
+
+  return result;
+}
+
+#define PITCH_CAL_MIN_DEG      5.0f
+#define PITCH_CAL_MAX_DEG     50.0f
+#define PITCH_CAL_STEP_DEG     5.0f
+#define PITCH_CAL_POINT_COUNT  10U
+
+
+typedef struct
+{
+  float target_deg;
+
+  float measured_up_deg;
+  float measured_down_deg;
+
+  float t_int_up;
+  float t_int_down;
+
+  uint32_t move_delay_up_ms;
+  uint32_t move_delay_down_ms;
+  float peak_velocity_up_deg_s;
+  float peak_velocity_down_deg_s;
+
+  Pitch_Compensation_Result_t comp;
+
+} Pitch_Cal_Point_t;
+
+
+
+static Pitch_Cal_Point_t pitch_points[PITCH_CAL_POINT_COUNT];
+
+void Pitch_Cal_Init_Points(void)
+{
+  memset(pitch_points, 0, sizeof(pitch_points));
+
+  for (uint8_t i = 0; i < PITCH_CAL_POINT_COUNT; i++)
+  {
+    pitch_points[i].target_deg = PITCH_CAL_MIN_DEG + i * PITCH_CAL_STEP_DEG;
+  }
+}
+
+
+typedef enum
+{
+  PITCH_CAL_UP = 0,
+  PITCH_CAL_DOWN,
+  PITCH_CAL_DONE
+} Pitch_Cal_Direction_t;
+
+typedef struct
+{
+  uint8_t index;
+  Pitch_Cal_Direction_t direction;
+
+  uint8_t waiting;
+  uint8_t sampling;
+  uint32_t stable_start_ms;
+
+  uint32_t move_command_ms;
+  uint32_t move_delay_ms;
+  float move_start_deg;
+  float peak_velocity_deg_s;
+  uint8_t move_started;
+
+} Pitch_Cal_Runtime_t;
+
+static Pitch_Cal_Runtime_t pitch_cal_runtime = {0};
+static float pitch_gravity_ff_scale = 0.0f;
+static float pitch_gravity_ff_applied_nm = 0.0f;
+static volatile float pitch_friction_ff_scale = 1.0f;
+
+void Pitch_Cal_Start(void)
+{
+  /* Calibration must measure PID holding torque without feedforward. */
+  pitch_gravity_ff_scale = 0.0f;
+  pitch_gravity_ff_reset();
+  Pitch_Cal_Init_Points();
+
+  pitch_cal_runtime.index = 0;
+  pitch_cal_runtime.direction = PITCH_CAL_UP;
+  pitch_cal_runtime.waiting = 0;
+  pitch_cal_runtime.sampling = 0;
+  pitch_cal_runtime.stable_start_ms = 0;
+  pitch_cal_runtime.move_command_ms = 0U;
+  pitch_cal_runtime.move_delay_ms = UINT32_MAX;
+  pitch_cal_runtime.move_start_deg = 0.0f;
+  pitch_cal_runtime.peak_velocity_deg_s = 0.0f;
+  pitch_cal_runtime.move_started = 0U;
+}
+
+
+
+void Pitch_Cal_Save(uint8_t index,Pitch_Cal_Direction_t direction,float measured_deg,float t_int)
+{
+  if (index >= PITCH_CAL_POINT_COUNT)
+    return;
+
+  if (direction == PITCH_CAL_UP)
+  {
+    pitch_points[index].measured_up_deg = measured_deg;
+    pitch_points[index].t_int_up = t_int;
+  }
+  else
+  {
+    pitch_points[index].measured_down_deg = measured_deg;
+    pitch_points[index].t_int_down = t_int;
+  }
+}
+
+
+void Pitch_Cal_Calculate_All(void)
+{
+  /* 5 deg and 50 deg are approach/turnaround endpoints. Only 10..45 deg
+   * have valid measurements from both travel directions. */
+  for (uint8_t i = 1U; i < (PITCH_CAL_POINT_COUNT - 1U); i++)
+  {
+    pitch_points[i].comp =
+        Pitch_Calc_Comp(
+            pitch_points[i].target_deg,
+            pitch_points[i].measured_up_deg,
+            pitch_points[i].measured_down_deg,
+            pitch_points[i].t_int_up,
+            pitch_points[i].t_int_down);
+  }
+}
+
+static float Pitch_Compensation_FF_Lookup(float measured_deg)
+{
+  if ((pitch_cal_runtime.direction != PITCH_CAL_DONE) ||
+      (pitch_gravity_ff_scale <= 0.0f) ||
+      (measured_deg < PITCH_GRAVITY_FF_MIN_DEG) ||
+      (measured_deg > PITCH_GRAVITY_FF_MAX_DEG))
+  {
+    return 0.0f;
+  }
+
+  const uint8_t first = 1U; /* 10 deg */
+  const uint8_t last = 6U;  /* 35 deg */
+
+  float gravity_nm;
+  float friction_nm;
+
+  if (measured_deg >= pitch_points[last].target_deg)
+  {
+    gravity_nm = pitch_points[last].comp.gravity_torque;
+    friction_nm = pitch_points[last].comp.friction_torque;
+  }
+  else
+    {
+    uint8_t lower = first;
+
+    while ((lower < last) && (measured_deg > pitch_points[lower + 1U].target_deg))
+      {
+        lower++;
+      }
+    const float x0 = pitch_points[lower].target_deg;
+    const float ratio = (measured_deg - x0) / PITCH_CAL_STEP_DEG;
+    const float g0 = pitch_points[lower].comp.gravity_torque;
+    const float g1 = pitch_points[lower + 1U].comp.gravity_torque;
+    const float f0 = pitch_points[lower].comp.friction_torque;
+    const float f1 = pitch_points[lower + 1U].comp.friction_torque;
+    gravity_nm = g0 + ratio * (g1 - g0);
+    friction_nm = f0 + ratio * (f1 - f0);
+  }
+
+  const float compensation_nm = gravity_nm + (float)pitch_approach_sign * pitch_friction_ff_scale * friction_nm;
+
+  return clampf(compensation_nm * pitch_gravity_ff_scale,
+                -PITCH_GRAVITY_FF_MAX_ABS_NM,
+                PITCH_GRAVITY_FF_MAX_ABS_NM);
+}
+
+static void pitch_gravity_ff_reset(void)
+{
+  pitch_gravity_ff_applied_nm = 0.0f;
+}
+
+static float pitch_gravity_ff_update(float measured_deg, uint32_t elapsed_ms)
+{
+  const float desired_nm = Pitch_Compensation_FF_Lookup(measured_deg);
+  const uint32_t limited_ms = (elapsed_ms > PITCH_GRAVITY_FF_MAX_STEP_MS) ?
+                              PITCH_GRAVITY_FF_MAX_STEP_MS : elapsed_ms;
+  const float max_delta_nm = PITCH_GRAVITY_FF_RATE_NM_S *
+                             ((float)limited_ms / 1000.0f);
+  const float delta_nm = clampf(desired_nm - pitch_gravity_ff_applied_nm,
+                                -max_delta_nm, max_delta_nm);
+  pitch_gravity_ff_applied_nm += delta_nm;
+  return pitch_gravity_ff_applied_nm;
+}
+
+uint8_t Gimbal_Pitch_Set_Gravity_FF_Scale(float scale)
+{
+  if (!isfinite(scale) || (scale < 0.0f) || (scale > 1.0f)) return 0U;
+  if (scale == 0.0f) {
+    pitch_gravity_ff_scale = 0.0f;
+    pitch_gravity_ff_reset();
+    g_pitch_test.applied_t_ff_nm = 0.0f;
+    return 1U;
+  }
+  if ((scale > 0.0f) && (pitch_cal_runtime.direction != PITCH_CAL_DONE)) return 0U;
+  pitch_gravity_ff_scale = scale;
+  return 1U;
+}
+
+static void Pitch_Cal_Move_Diagnostics_Start(uint32_t now_ms)
+{
+  pitch_cal_runtime.move_command_ms = now_ms;
+  pitch_cal_runtime.move_delay_ms = UINT32_MAX;
+  pitch_cal_runtime.move_start_deg =
+      g_pitch_test.measured_relative_rad * RAD_TO_DEG;
+  pitch_cal_runtime.peak_velocity_deg_s = 0.0f;
+  pitch_cal_runtime.move_started = 0U;
+}
+
+static void Pitch_Cal_Move_Diagnostics_Update(uint32_t now_ms)
+{
+  const float measured_deg =
+      g_pitch_test.measured_relative_rad * RAD_TO_DEG;
+  const float velocity_deg_s =
+      fabsf(g_pitch_test.measured_velocity_rad_s) * RAD_TO_DEG;
+
+  if (velocity_deg_s > pitch_cal_runtime.peak_velocity_deg_s) {
+    pitch_cal_runtime.peak_velocity_deg_s = velocity_deg_s;
+  }
+  if ((pitch_cal_runtime.move_started == 0U) &&
+      (fabsf(measured_deg - pitch_cal_runtime.move_start_deg) >=
+       PITCH_MOVE_DETECT_DEG)) {
+    pitch_cal_runtime.move_started = 1U;
+    pitch_cal_runtime.move_delay_ms =
+        now_ms - pitch_cal_runtime.move_command_ms;
+  }
+}
+
+static void Pitch_Cal_Move_Diagnostics_Save(
+    uint8_t index, Pitch_Cal_Direction_t direction)
+{
+  if (direction == PITCH_CAL_UP) {
+    pitch_points[index].move_delay_up_ms = pitch_cal_runtime.move_delay_ms;
+    pitch_points[index].peak_velocity_up_deg_s =
+        pitch_cal_runtime.peak_velocity_deg_s;
+  } else {
+    pitch_points[index].move_delay_down_ms = pitch_cal_runtime.move_delay_ms;
+    pitch_points[index].peak_velocity_down_deg_s =
+        pitch_cal_runtime.peak_velocity_deg_s;
+  }
+}
+
+static void Pitch_Sampler_Reset(void);
+static void Pitch_Sampler_Push(void);
+static void Pitch_Sampler_Get_Result(float *measured_deg,float *t_int);
+
+typedef struct {
+  uint8_t count;
+  uint32_t last_rx_count;
+
+  float measured_sum;
+  float measured_min;
+  float measured_max;
+
+  float torque_sum;
+  float torque_min;
+  float torque_max;
+}Pitch_Sampler_t;
+
+static Pitch_Sampler_t pitch_sampler;
+
+void Pitch_Cal_Update(uint32_t now_ms) {
+
+  if (pitch_cal_runtime.direction == PITCH_CAL_DONE) return;
+
+  uint8_t index = pitch_cal_runtime.index;
+
+  if (pitch_cal_runtime.waiting == 0U) {
+    if (Gimbal_Pitch_Set_Target_Deg(pitch_points[index].target_deg) != 0U)
+      {
+        pitch_cal_runtime.waiting = 1U;
+        pitch_cal_runtime.stable_start_ms = 0U;
+        Pitch_Cal_Move_Diagnostics_Start(now_ms);
+      }
+    return;
+  }
+
+  Pitch_Cal_Move_Diagnostics_Update(now_ms);
+
+  /* command 还没走到 target */
+  float command_error_deg =
+      fabsf(
+          g_pitch_test.target_relative_rad -
+          g_pitch_test.command_relative_rad
+      ) * RAD_TO_DEG;
+
+  if (command_error_deg > 0.05f)
+  {
+    pitch_cal_runtime.stable_start_ms = 0;
+    pitch_cal_runtime.sampling = 0U;
+    return;
+  }
+
+  /* command 已经到了，开始等 400ms */
+  if (pitch_cal_runtime.stable_start_ms == 0)
+  {
+    pitch_cal_runtime.stable_start_ms = now_ms;
+    return;
+  }
+
+  if ((now_ms - pitch_cal_runtime.stable_start_ms) < 1000U) return;
+
+  if (pitch_cal_runtime.sampling == 0U)
+  {
+    Pitch_Sampler_Reset();
+    pitch_cal_runtime.sampling = 1U;
+  }
+
+  Pitch_Sampler_Push();
+
+  if (pitch_sampler.count < PITCH_SAMPLE_COUNT) return;//采集PITCH_SAMPLE_COUNT（15）次
+
+  float measured_deg;
+  float t_int;
+
+  Pitch_Sampler_Get_Result(&measured_deg, &t_int);
+
+  Pitch_Cal_Save(index,pitch_cal_runtime.direction,measured_deg,t_int);
+  Pitch_Cal_Move_Diagnostics_Save(index, pitch_cal_runtime.direction);
+
+  pitch_cal_runtime.waiting = 0U;
+  pitch_cal_runtime.sampling = 0U;
+
+  /////////////////////////////////////////////状态切换
+  if (pitch_cal_runtime.direction == PITCH_CAL_UP) {
+    if (index < PITCH_CAL_POINT_COUNT - 1U)
+    {
+      pitch_cal_runtime.index++;
+    }
+    else {
+      pitch_cal_runtime.direction = PITCH_CAL_DOWN;
+      pitch_cal_runtime.index--;
+    }
+  }
+  else {
+    if (index > 0U){
+      pitch_cal_runtime.index--;
+    }
+    else {
+      pitch_cal_runtime.direction = PITCH_CAL_DONE;
+
+      Pitch_Cal_Calculate_All( );
+    }
+  }
+  /////////////////////////////////////////////状态切换
+}
+
+
+
+static void Pitch_Sampler_Reset(void)
+{
+  pitch_sampler.count = 0U;
+
+  pitch_sampler.measured_sum = 0.0f;
+  pitch_sampler.torque_sum = 0.0f;
+
+  pitch_sampler.last_rx_count = dm_motor[Pitch].rx_count;
+}
+
+static void Pitch_Sampler_Push(void) {
+  if (dm_motor[Pitch].rx_count == pitch_sampler.last_rx_count) return;
+
+  pitch_sampler.last_rx_count = dm_motor[Pitch].rx_count;
+
+  float measured = g_pitch_test.measured_relative_rad * RAD_TO_DEG;
+
+  float torque = dm_motor[Pitch].t_int;
+
+  if (pitch_sampler.count == 0U) {
+    pitch_sampler.measured_min = measured;
+    pitch_sampler.measured_max = measured;
+
+    pitch_sampler.torque_min = torque;
+    pitch_sampler.torque_max = torque;
+  }
+
+  pitch_sampler.measured_sum += measured;
+  pitch_sampler.torque_sum += torque;
+
+  if (measured < pitch_sampler.measured_min) pitch_sampler.measured_min = measured;
+  if (measured > pitch_sampler.measured_max) pitch_sampler.measured_max = measured;
+
+  if (torque < pitch_sampler.torque_min) pitch_sampler.torque_min = torque;
+  if (torque > pitch_sampler.torque_max) pitch_sampler.torque_max = torque;
+
+  pitch_sampler.count++;
+}
+
+
+
+static void Pitch_Sampler_Get_Result(float *measured_deg,float *t_int) {
+  const float n = 1.0f / (float)(PITCH_SAMPLE_COUNT - 2U);
+
+  *measured_deg = (pitch_sampler.measured_sum - pitch_sampler.measured_min - pitch_sampler.measured_max) * n ;
+
+  *t_int = (pitch_sampler.torque_sum - pitch_sampler.torque_max - pitch_sampler.torque_min) * n;
 }

@@ -177,7 +177,10 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  if (HAL_RCC_DeInit() != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -218,6 +221,7 @@ int main(void)
 #endif
 #endif
 
+  Pitch_Cal_Start();
 
   /* USER CODE END 2 */
 
@@ -234,8 +238,9 @@ int main(void)
     uint32_t now_us = DWT_Read();
     uint32_t now_ms = HAL_GetTick();
 
-    Gimbal_Yaw_Test_Update(
-        now_ms, HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin));
+    Gimbal_Yaw_Test_Update(now_ms, HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin));
+
+    Pitch_Cal_Update(now_ms);
 
 #if VISION_PROTOCOL_ENABLED
     Vision_Protocol_Service();
@@ -312,7 +317,7 @@ int main(void)
     {
     char dbg_buf[320];
     snprintf(dbg_buf, sizeof(dbg_buf),
-            "%.3f,%.3f,%.3f,%.3f\r\n",
+            "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
             // "%.3f,%.3f,%.3f,%.3f,%u,%u,%u,"
             // "%d,%d,%d,%u,%d,%d,%d,%u,%d,%d,%d,%u\r\n",
             // g_yaw_test.target_relative_rad * RAD_TO_DEG,
@@ -322,8 +327,9 @@ int main(void)
             g_pitch_test.target_relative_rad * RAD_TO_DEG,
             g_pitch_test.command_relative_rad * RAD_TO_DEG,
             g_pitch_test.measured_relative_rad * RAD_TO_DEG,
-            g_pitch_test.measured_velocity_rad_s * RAD_TO_DEG
-            //motor->p_int
+            g_pitch_test.measured_velocity_rad_s * RAD_TO_DEG,
+            dm_motor[1].t_int,
+            g_pitch_test.applied_t_ff_nm
             // g_yaw_test.measured_velocity_rad_s * RAD_TO_DEG,
             //g_yaw_test.max_speed_rad_s * RAD_TO_DEG,
             // (unsigned)(g_yaw_test.state == YAW_TEST_ACTIVE),

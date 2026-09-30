@@ -170,6 +170,13 @@ static void Parse_Command(const char *cmd, int16_t target[Motor_Count]) {
     UART_Command_Result("pkd", ok);
     return;
   }
+  if (strcmp(name, "pff") == 0) {
+    char extra = '\0';
+    const uint8_t ok = (sscanf(cmd, "%*s %f %c", &value, &extra) == 1) &&
+                       Gimbal_Pitch_Set_Gravity_FF_Scale(value);
+    UART_Command_Result("pff", ok);
+    return;
+  }
   if (strcmp(name, "stop") == 0) {
     Gimbal_Stop_All();
     Shooter_Stop(target);
@@ -287,14 +294,3 @@ void UART_Poll_Command(int16_t target[Motor_Count]) {
         }
     }
 }
-
-// void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-// {
-//   if (huart == &huart2)
-//   {
-//     if (huart->ErrorCode & HAL_UART_ERROR_ORE)
-//       ore = true;
-//
-//     HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
-//   }
-// }
