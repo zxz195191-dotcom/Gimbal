@@ -1,3 +1,4 @@
+#include "yaw_diagnostics.h"
 #include "headfile.h"
 #include <stdarg.h>
 // 电机物理极限参数
@@ -479,7 +480,10 @@ HAL_StatusTypeDef dm4310_send_mit(CAN_HandleTypeDef *hcan, uint16_t motor_id, fl
   tx_data[7] = t_int & 0xFF;
 
   // 3. 压入发送邮箱
-  return Can_Send_Std(hcan, motor_id, tx_data, 8);
+  YawDiag_MitPacked(motor_id,tx_data);
+  const HAL_StatusTypeDef result=Can_Send_Std(hcan, motor_id, tx_data, 8);
+  YawDiag_MitResult(motor_id,(uint8_t)result);
+  return result;
 }
 
 

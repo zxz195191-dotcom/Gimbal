@@ -66,6 +66,13 @@ void Error_Handler(void);
 #define LED1_Pin GPIO_PIN_1
 #define LED1_GPIO_Port GPIOG
 
+#define MPU6500_CS_Pin GPIO_PIN_6
+#define MPU6500_CS_GPIO_Port GPIOF
+#define MPU6500_INT_Pin GPIO_PIN_8
+#define MPU6500_INT_GPIO_Port GPIOB
+#define IMU_HEATER_Pin GPIO_PIN_5
+#define IMU_HEATER_GPIO_Port GPIOB
+
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */

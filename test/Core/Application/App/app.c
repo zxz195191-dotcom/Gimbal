@@ -1,4 +1,9 @@
+#include "yaw_diagnostics.h"
 #include "headfile.h"
+#include "pitch_continuous_cal.h"
+#include "imu_mpu6500.h"
+#include "imu_attitude.h"
+#include "imu_heater.h"
 
 #define COMMAND_ACK_HALF_PERIOD_MS 100U
 #define COMMAND_ACK_HALF_CYCLES    6U
@@ -108,6 +113,80 @@ static void Parse_Command(const char *cmd, int16_t target[Motor_Count]) {
     name[i] = (char)tolower((unsigned char)name[i]);
   }
 
+  if (strcmp(name,"yprobe")==0) {
+    unsigned request_id; char extra;
+    const uint8_t ok=sscanf(cmd,"%*s %u %c",&request_id,&extra)==1;
+    if (ok) Gimbal_Yaw_Probe_Request((uint32_t)request_id);
+    UART_Command_Result("yprobe",ok); return;
+  }
+  if (strcmp(name,"ydiag")==0) {
+    char action[8], extra;
+    uint8_t ok=sscanf(cmd,"%*s %7s %c",action,&extra)==1;
+    unsigned operation=3;
+    if (ok) {
+      if (strcmp(action,"arm")==0) operation=0;
+      else if (strcmp(action,"stop")==0) operation=1;
+      else if (strcmp(action,"dump")==0) operation=2;
+      ok=Gimbal_Yaw_Diag_Command(operation);
+    }
+    UART_Command_Result("ydiag",ok); return;
+  }
+  if (strcmp(name,"ycalarm")==0 || strcmp(name,"ycal")==0 ||
+      strcmp(name,"ycalstop")==0 || strcmp(name,"ydump")==0 || strcmp(name,"ystat")==0) {
+    char extra; uint8_t ok=sscanf(cmd,"%*s %c",&extra)!=1;
+    if (ok) {
+      if (strcmp(name,"ycalarm")==0) ok=Gimbal_Yaw_Cal_Arm();
+      else if (strcmp(name,"ycal")==0) ok=Gimbal_Yaw_Cal_Start();
+      else if (strcmp(name,"ycalstop")==0) Gimbal_Yaw_Cal_Stop();
+    }
+    Gimbal_Load_Command_Result(name,ok);
+    UART_Command_Result(name,ok); return;
+  }
+  if (strcmp(name,"yboost")==0) {
+    unsigned enable; char extra;
+    const uint8_t ok=sscanf(cmd,"%*s %u %c",&enable,&extra)==1 && enable<=1 &&
+        Gimbal_Yaw_Position_Boost_Enable((uint8_t)enable);
+    UART_Command_Result(name,ok); return;
+  }
+  if (strcmp(name,"yff")==0 || strcmp(name,"yi")==0 || strcmp(name,"pi")==0) {
+    unsigned enable; char extra;
+    uint8_t ok=sscanf(cmd,"%*s %u %c",&enable,&extra)==1 && enable<=1;
+    if (ok) ok=strcmp(name,"yff")==0 ? Gimbal_Yaw_Friction_Enable((uint8_t)enable) :
+      Gimbal_Load_Integral_Enable(name[0]=='y'?Yaw:Pitch,(uint8_t)enable);
+    Gimbal_Load_Command_Result(name,ok);
+    UART_Command_Result(name,ok); return;
+  }
+  if (strcmp(name, "imu") == 0) {
+    unsigned mode;
+    char extra;
+    uint8_t ok = (sscanf(cmd, "%*s %u %c", &mode, &extra) == 1) && (mode <= 5U);
+    /* Legacy imu 0..5 commands remain accepted; telemetry is always six columns. */
+    if (ok) g_imu_log_mode = 0U;
+    UART_Command_Result("imu", ok);
+    return;
+  }
+  if (strcmp(name, "imureset") == 0) {
+    char extra;
+    const uint8_t ok = (sscanf(cmd, "%*s %c", &extra) != 1);
+    if (ok) IMU_RequestRestart();
+    UART_Command_Result("imureset", ok);
+    return;
+  }
+  if (strcmp(name, "imucal") == 0) {
+    char extra;
+    uint8_t ok = sscanf(cmd, "%*s %c", &extra) != 1;
+    if (ok) IMU_AttitudeRequestCalibration();
+    UART_Command_Result("imucal", ok);
+    return;
+  }
+  if (strcmp(name, "imuheat") == 0) {
+    unsigned enabled;
+    char extra;
+    uint8_t ok = sscanf(cmd, "%*s %u %c", &enabled, &extra) == 1 && enabled <= 1U;
+    if (ok) IMU_HeaterSetEnabled((uint8_t)enabled);
+    UART_Command_Result("imuheat", ok);
+    return;
+  }
   if (strcmp(name, "ge") == 0) {
     Gimbal_Enable_All();
     UART_Command_Result("ge", 1U);
@@ -126,6 +205,28 @@ static void Parse_Command(const char *cmd, int16_t target[Motor_Count]) {
     UART_Command_Result("pr", Parse_Axis_Relative_Target(cmd, 0U));
     return;
   }
+  if (strcmp(name,"pmode")==0) {
+    unsigned mode; char extra;
+    const uint8_t ok=sscanf(cmd,"%*s %u %c",&mode,&extra)==1 && mode<=1U &&
+        Gimbal_Pitch_Set_Mode((Pitch_Control_Mode_t)mode);
+    Gimbal_Pitch_Probe();
+    UART_Command_Result("pmode",ok); return;
+  }
+  if (strcmp(name,"pprobe")==0) {
+    char extra;
+    const uint8_t ok=sscanf(cmd,"%*s %c",&extra)!=1;
+    if (ok) Gimbal_Pitch_Probe();
+    UART_Command_Result("pprobe",ok); return;
+  }
+  if (strcmp(name, "ymode") == 0) {
+    unsigned mode;
+    char extra;
+    const uint8_t ok = sscanf(cmd, "%*s %u %c", &mode, &extra) == 1 &&
+        mode <= 1U && Gimbal_Yaw_Set_Mode((Yaw_Control_Mode_t)mode);
+    if (ok) g_imu_log_mode = 0U;
+    UART_Command_Result("ymode", ok);
+    return;
+  }
   if (strcmp(name, "ye") == 0) {
     Gimbal_Yaw_Enable();
     UART_Command_Result("ye", g_yaw_test.state != YAW_TEST_FAULT);
@@ -139,6 +240,51 @@ static void Parse_Command(const char *cmd, int16_t target[Motor_Count]) {
   if (strcmp(name, "pe") == 0) {
     Gimbal_Pitch_Enable();
     UART_Command_Result("pe", g_pitch_test.state != YAW_TEST_FAULT);
+    return;
+  }
+  if (strcmp(name, "pcal") == 0) {
+    char extra;
+    const uint8_t ok = (sscanf(cmd, "%*s %c", &extra) != 1) && Pitch_Cont_Start();
+    if (ok) g_imu_log_mode = 0U;
+    UART_Command_Result("pcal", ok);
+    return;
+  }
+  if (strcmp(name, "ptest") == 0 || strcmp(name, "ytest") == 0) {
+    const uint8_t is_yaw = name[0] == 'y';
+    const float center_deg = Gimbal_Yaw_Control_Angle_Rad() * 57.2957795f;
+    float min_deg = is_yaw ? center_deg - 10.0f : 25.0f;
+    float max_deg = is_yaw ? center_deg + 10.0f : PITCH_SCAN_MAX_ACTUAL_DEG;
+    float speed_deg_s = 5.0f;
+    char extra;
+    const uint8_t no_arg = sscanf(cmd, "%*s %c", &extra) != 1;
+    uint8_t ok = no_arg || sscanf(cmd, "%*s %f %f %f %c",
+        &min_deg, &max_deg, &speed_deg_s, &extra) == 3;
+    if (ok) ok = is_yaw ? Gimbal_Yaw_Repeat_Start(min_deg, max_deg, speed_deg_s) :
+                          Gimbal_Pitch_Repeat_Start(min_deg, max_deg, speed_deg_s);
+    if (ok) g_imu_log_mode = 0U;
+    UART_Command_Result(name, ok);
+    return;
+  }
+  if (strcmp(name, "ycancel") == 0) {
+    char extra;
+    const uint8_t ok = sscanf(cmd, "%*s %c", &extra) != 1;
+    if (ok) Gimbal_Yaw_Repeat_Cancel();
+    UART_Command_Result(name, ok);
+    return;
+  }
+  if (strcmp(name, "pscan") == 0) {
+    char extra;
+    const uint8_t no_arg = (sscanf(cmd, "%*s %c", &extra) != 1);
+    const uint8_t ok = no_arg && Gimbal_Pitch_Scan_Start();
+    if (ok) g_imu_log_mode = 0U;
+    UART_Command_Result("pscan", ok);
+    return;
+  }
+  if (strcmp(name, "pcancel") == 0) {
+    char extra;
+    const uint8_t ok = (sscanf(cmd, "%*s %c", &extra) != 1);
+    if (ok) Gimbal_Pitch_Scan_Cancel();
+    UART_Command_Result("pcancel", ok);
     return;
   }
   if (strcmp(name, "pd") == 0) {
@@ -234,63 +380,81 @@ static void Parse_Command(const char *cmd, int16_t target[Motor_Count]) {
 }
 
 
-#define UART_RX_RING_SIZE 128
-
+#define UART_RX_RING_SIZE 128U
 static volatile uint8_t uart_rx_ring[UART_RX_RING_SIZE];
-static volatile uint16_t uart_rx_head = 0;
-static volatile uint16_t uart_rx_tail = 0;
+static volatile uint16_t uart_rx_head, uart_rx_tail;
+static volatile uint8_t uart_rx_restart_pending;
 uint8_t uart2_rx_byte;
-volatile bool ring_overflow  = false, ore = false;
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart == &huart2)
-  {
-    uint16_t next =
-        (uint16_t)((uart_rx_head + 1U) % UART_RX_RING_SIZE);
+volatile bool ring_overflow = false, ore = false;
+// Inspect in debugger without changing the wire protocol.
+volatile uint32_t g_uart_rx_errors, g_uart_rx_last_error;
+volatile uint32_t g_uart_rx_recoveries, g_uart_rx_bytes;
+volatile uint32_t g_uart_command_count, g_uart_command_rejected;
+volatile uint32_t g_uart_poll_ms;
 
-    if (next != uart_rx_tail)
-    {
-      uart_rx_ring[uart_rx_head] = uart2_rx_byte;
-      uart_rx_head = next;
-    }else {
-      ring_overflow  = true;
-    }
-
-    HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
-  }
+void UART_Command_RxError(uint32_t error) {
+  ++g_uart_rx_errors;
+  g_uart_rx_last_error = error;
+  if (error & HAL_UART_ERROR_ORE) ore = true;
+  uart_rx_restart_pending = 1U;
 }
 
-
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart != &huart2) return;
+  ++g_uart_rx_bytes;
+  const uint16_t next = (uint16_t)((uart_rx_head + 1U) % UART_RX_RING_SIZE);
+  if (next != uart_rx_tail) {
+    uart_rx_ring[uart_rx_head] = uart2_rx_byte;
+    uart_rx_head = next;
+  } else {
+    ring_overflow = true;
+    uart_rx_restart_pending = 1U;
+  }
+  if (HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1) != HAL_OK)
+    uart_rx_restart_pending = 1U;
+}
 
 void UART_Poll_Command(int16_t target[Motor_Count]) {
   static char rx_buf[32];
-  static uint8_t rx_len;
-
-  while (uart_rx_tail != uart_rx_head) {
-
-    if (uart_rx_tail == uart_rx_head) return;
-
-    const uint8_t c = uart_rx_ring[uart_rx_tail];
-
-    uart_rx_tail = ((uart_rx_tail + 1U) % UART_RX_RING_SIZE);
-
-      if ((c == '\r') || (c == '\n')) {
-            if (rx_len > 0U) {
-
-              rx_buf[rx_len] = '\0';
-
-              Parse_Command(rx_buf, target);
-
-              rx_len = 0U;
-            }
-        }
-        else if (rx_len < (sizeof(rx_buf) - 1U))
-        {
-          rx_buf[rx_len++] = (char)c;
-        }
-        else
-        {
-          rx_len = 0U;
-        }
+  static uint8_t rx_len, discard_line;
+  g_uart_poll_ms = HAL_GetTick();
+  // Bound work per loop so continuous host traffic cannot starve control/IMU.
+  for (unsigned consumed = 0U; consumed < UART_RX_RING_SIZE; ++consumed) {
+    if (uart_rx_restart_pending) {
+      // Debug mode uses byte interrupts, not RX DMA. Keep this critical section
+      // short; TX is independent and must not be aborted here.
+      const uint32_t primask = __get_PRIMASK();
+      __disable_irq();
+      (void)HAL_UART_AbortReceive(&huart2);
+      __HAL_UART_CLEAR_OREFLAG(&huart2);
+      uart_rx_tail = uart_rx_head;
+      rx_len = 0U;
+      discard_line = 1U; // Never execute the tail of a damaged command.
+      uart_rx_restart_pending = 0U;
+      if (HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1) != HAL_OK)
+        uart_rx_restart_pending = 1U;
+      else
+        ++g_uart_rx_recoveries;
+      if (!primask) __enable_irq();
+      return;
     }
+    if (uart_rx_tail == uart_rx_head) return;
+    const uint8_t c = uart_rx_ring[uart_rx_tail];
+    uart_rx_tail = (uint16_t)((uart_rx_tail + 1U) % UART_RX_RING_SIZE);
+    if (c == '\r' || c == '\n') {
+      if (!discard_line && rx_len > 0U) {
+        rx_buf[rx_len] = '\0';
+        // An ISR may have flagged a lost byte since this iteration began.
+        if (uart_rx_restart_pending) continue;
+        Parse_Command(rx_buf, target);
+        ++g_uart_command_count;
+        if (!command_parse_ok) ++g_uart_command_rejected;
+      }
+      rx_len = 0U;
+      discard_line = 0U;
+    } else if (!discard_line) {
+      if (rx_len < sizeof(rx_buf) - 1U) rx_buf[rx_len++] = (char)c;
+      else { rx_len = 0U; discard_line = 1U; ++g_uart_command_rejected; }
+    }
+  }
 }

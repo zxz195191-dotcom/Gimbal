@@ -21,6 +21,7 @@
 #include "vision_protocol.h"
 #include "shooter.h"
 #include "saftery.h"
+#include "pitch_calibration.h"
 
 
 #define P 6.0f
@@ -32,7 +33,14 @@
 #define CAN_TX_PERIOD_US   2000U   // 2ms发一次CAN
 #define VISION_TX_PERIOD_US 5000U  // 5ms向NUC发送一帧
 #define KEY_SCAN_PERIOD_US 10000U  // 10ms扫一次按键
-#define DBG_PRINT_PERIOD_US 100000U // 100ms VOFA+ CSV state output
+/* Telemetry only; does not change motor control or IMU sample periods. */
+#ifndef TELEMETRY_HZ
+#define TELEMETRY_HZ 50U
+#endif
+#if TELEMETRY_HZ != 10U && TELEMETRY_HZ != 20U && TELEMETRY_HZ != 50U
+#error "TELEMETRY_HZ must be 10, 20, or 50"
+#endif
+#define DBG_PRINT_PERIOD_US (1000000U / TELEMETRY_HZ)
 #define C620_FEEDBACK_TIMEOUT_US 20000U
 #define C620_MAX_VALID_RPM       12000
 #define FRICTION_MAX_RPM         9000.0f

@@ -44,9 +44,23 @@ add_executable(${CMAKE_PROJECT_NAME}
         Core/Application/Devices/Motor/dm_motor.c
         Core/Application/Devices/Can_Dispatch/can_dispatch.c
         Core/Application/Devices/Vision/vision_protocol.c
+        Core/Application/Devices/IMU/imu_mpu6500.c
+        Core/Application/Devices/IMU/imu_frame.c
+        Core/Application/Devices/IMU/imu_attitude.c
+        Core/Application/Devices/IMU/imu_heater.c
+        Core/Application/Devices/IMU/imu_heater_port.c
+        ThirdParty/Fusion/FusionAhrs.c
 
         # -------- Module 机构业务：云台、发射、安全 --------
         Core/Application/Module/Gimbal/gimbal.c
+        Core/Application/Module/Gimbal/yaw_inertial.c
+        Core/Application/Module/Gimbal/pitch_inertial.c
+        Core/Application/Module/Gimbal/yaw_diagnostics.c
+        Core/Application/Module/Gimbal/yaw_friction_goal.c
+        Core/Application/Module/Gimbal/load_compensation.c
+        Core/Application/Module/Gimbal/yaw_load_cal.c
+        Core/Application/Module/Gimbal/pitch_calibration.c
+        Core/Application/Module/Gimbal/pitch_continuous_cal.c
         Core/Application/Module/Shooter/shooter.c
         Core/Application/Module/Saftery/saftery.c
 )
@@ -76,6 +90,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/Application/Devices/Motor
     ${CMAKE_SOURCE_DIR}/Core/Application/Devices/Can_Dispatch
     ${CMAKE_SOURCE_DIR}/Core/Application/Devices/Vision
+    ${CMAKE_SOURCE_DIR}/Core/Application/Devices/IMU
+    ${CMAKE_SOURCE_DIR}/ThirdParty/Fusion
 
     # Module
     ${CMAKE_SOURCE_DIR}/Core/Application/Module
@@ -86,6 +102,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+    FUSION_USE_NORMAL_SQRT
     # Add user defined symbols
 )
 

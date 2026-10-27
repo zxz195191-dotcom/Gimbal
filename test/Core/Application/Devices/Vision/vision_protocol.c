@@ -253,9 +253,13 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
   if ((huart != NULL) && (huart->Instance == USART2)) {
+#if VISION_PROTOCOL_ENABLED
     vision_status.uart_errors++;
     tx_busy = 0U;
     rx_restart_pending = 1U;
+#else
+    UART_Command_RxError(huart->ErrorCode);
+#endif
   }
 }
 

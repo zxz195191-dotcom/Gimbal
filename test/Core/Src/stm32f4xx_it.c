@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "spi.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,6 +61,8 @@ extern CAN_HandleTypeDef hcan2;
 extern DMA_HandleTypeDef hdma_usart2_rx;
 extern DMA_HandleTypeDef hdma_usart2_tx;
 extern UART_HandleTypeDef huart2;
+extern DMA_HandleTypeDef hdma_spi5_rx;
+extern DMA_HandleTypeDef hdma_spi5_tx;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -270,6 +273,26 @@ void CAN2_RX0_IRQHandler(void)
   /* USER CODE BEGIN CAN2_RX0_IRQn 1 */
 
   /* USER CODE END CAN2_RX0_IRQn 1 */
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(MPU6500_INT_Pin);
+}
+
+void DMA2_Stream3_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_spi5_rx);
+}
+
+void DMA2_Stream4_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_spi5_tx);
+}
+
+void SPI5_IRQHandler(void)
+{
+  HAL_SPI_IRQHandler(&hspi5);
 }
 
 /* USER CODE BEGIN 1 */

@@ -26,6 +26,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "headfile.h"
+#include "pitch_continuous_cal.h"
+#include "spi.h"
+#include "imu_mpu6500.h"
+#include "imu_attitude.h"
+#include "imu_heater.h"
 #include <math.h>
 /* USER CODE END Includes */
 
@@ -112,16 +117,80 @@ static void DM_Id_Config_Led_Update(uint32_t now_ms) {
 #endif
 
 
-// 串口调试打印（阻塞发送，仅调试用；USART2 已配置 115200）
-void UART_Debug(const char *msg) {
-  static uint8_t tx_buffer[320];
-  if ((msg == NULL) || (huart2.gState != HAL_UART_STATE_READY)) return;
+// Debugger-only diagnostics; the CSV contains six angles plus successful-send interval.
+volatile uint32_t g_uart_tx_started, g_uart_tx_busy_skips;
+volatile uint32_t g_uart_tx_errors, g_uart_tx_recoveries;
+volatile uint32_t g_uart_tx_last_start_ms;
 
+// USART2 115200, DMA. Never queue old telemetry behind a busy transfer.
+static uint8_t UART_Debug_Send(const char *msg, uint8_t telemetry) {
+  static uint8_t tx_buffer[320];
+  static uint32_t busy_since_ms;
+  static uint8_t busy_seen, resync;
+  static uint8_t have_previous_tx;
+  static uint32_t previous_tx_cycles;
+  if (msg == NULL) return 0;
+  const uint32_t now = HAL_GetTick();
+  if (huart2.gState != HAL_UART_STATE_READY) {
+    ++g_uart_tx_busy_skips;
+    if (!busy_seen) { busy_seen = 1U; busy_since_ms = now; }
+    if ((uint32_t)(now - busy_since_ms) < 100U) return 0;
+    // Even a full 320-byte buffer takes less than 28 ms at 115200/8N1.
+    // Abort TX only; command reception must remain armed.
+    busy_since_ms = now;
+    if (HAL_UART_AbortTransmit(&huart2) != HAL_OK) {
+      ++g_uart_tx_errors;
+      return 0;
+    }
+    ++g_uart_tx_recoveries;
+    resync = 1U;
+  }
+  busy_seen = 0U;
+  const size_t prefix = resync ? 2U : 0U;
   size_t length = strlen(msg);
-  if (length > sizeof(tx_buffer)) length = sizeof(tx_buffer);
-  memcpy(tx_buffer, msg, length);
-  (void)HAL_UART_Transmit_DMA(&huart2, tx_buffer, (uint16_t)length);
+  while (length > 0U && (msg[length - 1U] == '\r' || msg[length - 1U] == '\n')) --length;
+  // Reserve interval, two feedback torques, CRLF and terminating NUL.
+  if (length == 0U || length > sizeof(tx_buffer) - prefix - (telemetry ? 48U : 3U)) {
+    ++g_uart_tx_errors;
+    return 0; // Never transmit a truncated CSV row.
+  }
+  if (resync) { tx_buffer[0] = '\r'; tx_buffer[1] = '\n'; }
+  memcpy(tx_buffer + prefix, msg, length);
+  // Read once after copying the six angles and checking DMA readiness.
+  // Only interval formatting remains before DMA starts; this is a software
+  // launch timestamp, not the exact first-bit time or the IMU sample time.
+  if (!telemetry) {
+    tx_buffer[prefix+length]='\r'; tx_buffer[prefix+length+1]='\n';
+    if (HAL_UART_Transmit_DMA(&huart2,tx_buffer,(uint16_t)(prefix+length+2))!=HAL_OK) return 0;
+    resync=0; return 1;
+  }
+  const float p_t_int = dm_motor[Pitch].t_int;
+  const float y_t_int = dm_motor[Yaw].t_int;
+  const uint32_t dwt_cycles = DWT->CYCCNT;
+  // Unsigned subtraction handles CYCCNT wrap when successful sends are less
+  // than one wrap period apart (~23.861 s at 180 MHz). First frame has no interval.
+  const double tx_dt_ms = have_previous_tx ?
+      (double)(uint32_t)(dwt_cycles - previous_tx_cycles) * 1000.0 / (double)SystemCoreClock : 0.0;
+  const int tail = snprintf((char *)tx_buffer + prefix + length,
+                            sizeof(tx_buffer) - prefix - length,
+                            ",%.3f,%.3f,%.3f\r\n", tx_dt_ms, (double)p_t_int, (double)y_t_int);
+  if (tail <= 0 || (size_t)tail >= sizeof(tx_buffer) - prefix - length) {
+    ++g_uart_tx_errors;
+    return 0;
+  }
+  if (HAL_UART_Transmit_DMA(&huart2, tx_buffer, (uint16_t)(length + prefix + (size_t)tail)) == HAL_OK) {
+    previous_tx_cycles = dwt_cycles;
+    have_previous_tx = 1U;
+    ++g_uart_tx_started;
+    g_uart_tx_last_start_ms = now;
+    resync = 0U;
+    return 1;
+  } else {
+    ++g_uart_tx_errors;
+  }
+  return 0;
 }
+void UART_Debug(const char *msg) { (void)UART_Debug_Send(msg,1U); }
 
 #if !DM_ID_CONFIG_MODE
 static void Gimbal_Status_Led_Update(void) {
@@ -197,8 +266,12 @@ int main(void)
   MX_USART2_UART_Init();
   HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
   MX_CAN2_Init();
+  MX_SPI5_Init();
   /* USER CODE BEGIN 2 */
   DWT_Init();
+  IMU_HeaterInit();
+  IMU_SetSampleCallback(IMU_AttitudeProcess);
+  IMU_Init();
   Can_Dispatch_Init();
 
 #if DM_ID_CONFIG_MODE
@@ -217,11 +290,9 @@ int main(void)
   uint32_t last_vision_tx = 0;
   VisionMode_e vision_mode = VISION_MODE_AIM;
 #else
-  uint32_t last_dbg = 0;
+  uint32_t last_dbg_ms = 0;
 #endif
 #endif
-
-  Pitch_Cal_Start();
 
   /* USER CODE END 2 */
 
@@ -229,18 +300,22 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    IMU_Service();
+    IMU_Sample_t imu_latest;
+    const uint8_t imu_stream_ok = IMU_GetSample(&imu_latest);
+    IMU_HeaterService(HAL_GetTick(), &imu_latest, imu_stream_ok);
+    IMU_AttitudeService(HAL_GetTick(), imu_stream_ok, g_imu_heater.stable);
+
+
 #if DM_ID_CONFIG_MODE
     const uint32_t now_ms = HAL_GetTick();
-    DM_Motor_Id_Config_Update(
-        now_ms, HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin));
+    DM_Motor_Id_Config_Update(now_ms, HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin));
     DM_Id_Config_Led_Update(now_ms);
 #else
     uint32_t now_us = DWT_Read();
     uint32_t now_ms = HAL_GetTick();
 
     Gimbal_Yaw_Test_Update(now_ms, HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin));
-
-    Pitch_Cal_Update(now_ms);
 
 #if VISION_PROTOCOL_ENABLED
     Vision_Protocol_Service();
@@ -312,49 +387,34 @@ int main(void)
   }
 
 #if !VISION_PROTOCOL_ENABLED
-  if (!command_ack_visible) {
-    TIME_TRIGGER(now_us, last_dbg, DBG_PRINT_PERIOD_US)
-    {
+  TIME_TRIGGER(HAL_GetTick(), last_dbg_ms, DBG_PRINT_PERIOD_US / 1000U)
+  {
+    char report[320];
+    if (Gimbal_Load_Report_Line(report,sizeof(report))) {
+      if (UART_Debug_Send(report,0U)) Gimbal_Load_Report_Advance();
+    } else if (!Gimbal_Load_Telemetry_Paused()) {
+    /* Fixed FireWater CSV: six angles in degrees plus successful-send interval in ms:
+     * p_cmd,p_enc,y_cmd,y_enc,imu_pitch,imu_yaw,tx_dt_ms,p_t_int,y_t_int.
+     * Commands are planned control setpoints, not final user targets.
+     * Encoders retain the first-enable zero; do not subtract the IMU origin.
+     * Display pitch sign matches the measured installation; fusion is unchanged.
+     * Yaw is wrapped ZYX heading (+left in the native sensor frame).
+     * Before publication IMU values are zero; on a fault they hold the last
+     * published sample. Validity/fault details remain available in the debugger.
+     * In inertial Yaw mode y_cmd uses the inertial origin, while y_enc remains
+     * encoder-relative. Their difference is only meaningful in encoder mode.
+     */
+    IMU_AttitudeSample_t attitude;
+    (void)IMU_AttitudeGet(HAL_GetTick(), &attitude);
     char dbg_buf[320];
     snprintf(dbg_buf, sizeof(dbg_buf),
-            "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
-            // "%.3f,%.3f,%.3f,%.3f,%u,%u,%u,"
-            // "%d,%d,%d,%u,%d,%d,%d,%u,%d,%d,%d,%u\r\n",
-            // g_yaw_test.target_relative_rad * RAD_TO_DEG,
-            // g_yaw_test.command_relative_rad * RAD_TO_DEG,
-            // g_yaw_test.measured_relative_rad * RAD_TO_DEG
-
-            g_pitch_test.target_relative_rad * RAD_TO_DEG,
-            g_pitch_test.command_relative_rad * RAD_TO_DEG,
-            g_pitch_test.measured_relative_rad * RAD_TO_DEG,
-            g_pitch_test.measured_velocity_rad_s * RAD_TO_DEG,
-            dm_motor[1].t_int,
-            g_pitch_test.applied_t_ff_nm
-            // g_yaw_test.measured_velocity_rad_s * RAD_TO_DEG,
-            //g_yaw_test.max_speed_rad_s * RAD_TO_DEG,
-            // (unsigned)(g_yaw_test.state == YAW_TEST_ACTIVE),
-            // (unsigned)g_yaw_test.fault,
-            // (unsigned)dm_motor[Yaw].state,
-            // g_pitch_test.target_relative_rad * RAD_TO_DEG,
-            // g_pitch_test.measured_relative_rad * RAD_TO_DEG,
-            // g_pitch_test.max_speed_rad_s * RAD_TO_DEG,
-            // g_pitch_test.measured_velocity_rad_s * RAD_TO_DEG,
-            // (unsigned)(g_pitch_test.state == YAW_TEST_ACTIVE),
-            // (unsigned)g_pitch_test.fault,
-            // (unsigned)dm_motor[Pitch].state,
-            // target_command_rpm[Friction_Left],
-            // motor_feedback[Friction_Left].speed_rmp,
-            // current_cmd[Friction_Left],
-            // (unsigned)Motor_Feedback_Valid(Friction_Left, now_us),
-            // target_command_rpm[Friction_Right],
-            // motor_feedback[Friction_Right].speed_rmp,
-            // current_cmd[Friction_Right],
-            // (unsigned)Motor_Feedback_Valid(Friction_Right, now_us),
-            // target_command_rpm[Feeder],
-            // motor_feedback[Feeder].speed_rmp,
-            // current_cmd[Feeder],
-            //(unsigned)Motor_Feedback_Valid(Feeder, now_us)
-            );
+             "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
+             g_pitch_test.command_relative_rad * RAD_TO_DEG,
+             g_pitch_test.measured_relative_rad * RAD_TO_DEG,
+             g_yaw_test.command_relative_rad * RAD_TO_DEG,
+             g_yaw_test.measured_relative_rad * RAD_TO_DEG,
+             -attitude.pitch_up_rad * RAD_TO_DEG,
+             attitude.yaw_left_rad * RAD_TO_DEG);
     UART_Debug(dbg_buf);
     }
   }
@@ -420,6 +480,18 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void HAL_GPIO_EXTI_Callback(uint16_t pin) {
+  if (pin == MPU6500_INT_Pin) IMU_OnDataReady();
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *spi) {
+  if (spi == &hspi5) IMU_OnTransferComplete();
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *spi) {
+  if (spi == &hspi5) IMU_OnSpiError(spi->ErrorCode);
+}
 
 /**
   * @brief  CAN FIFO0 接收中断回调
